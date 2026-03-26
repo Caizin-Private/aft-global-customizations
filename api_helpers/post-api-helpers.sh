@@ -5,7 +5,7 @@ echo "Executing Post-API Helpers"
 
 # =============================================================================
 # Remove aws-controltower-VPC and all associated resources
-# Deletion order: NAT GW → EIPs → IGW → Subnets → Route Tables → VPC
+# Deletion order: NAT GW → EIPs → IGW → Subnets → Route Tables → CF Stack → VPC
 # =============================================================================
 
 echo "Checking for aws-controltower-VPC..."
@@ -97,8 +97,24 @@ for RT_ID in $RT_IDS; do
   aws ec2 delete-route-table --route-table-id "$RT_ID" || echo "  Could not delete $RT_ID — skipping."
 done
 
-# 7. Delete the VPC
-echo "Deleting VPC: $VPC_ID"
-aws ec2 delete-vpc --vpc-id "$VPC_ID"
+# 7. Delete Control Tower VPC CloudFormation stack (owns the VPC resource)
+echo "Checking for Control Tower VPC CloudFormation stack..."
+CF_STACK=$(aws cloudformation list-stacks \
+  --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE \
+  --query 'StackSummaries[?contains(StackName,`AWSControlTowerBP-VPC-ACCOUNT-FACTORY`)].StackName' \
+  --output text)
+
+if [ -n "$CF_STACK" ]; then
+  echo "  Deleting CloudFormation stack: $CF_STACK"
+  aws cloudformation delete-stack --stack-name "$CF_STACK"
+  echo "  Waiting for stack deletion..."
+  aws cloudformation wait stack-delete-complete --stack-name "$CF_STACK"
+  echo "  CloudFormation stack deleted."
+else
+  echo "  No Control Tower VPC CloudFormation stack found."
+  # 8. Delete the VPC directly if no CF stack
+  echo "Deleting VPC: $VPC_ID"
+  aws ec2 delete-vpc --vpc-id "$VPC_ID"
+fi
 
 echo "aws-controltower-VPC and all associated resources successfully deleted."
