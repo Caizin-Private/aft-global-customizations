@@ -5,7 +5,9 @@ echo "Executing Post-API Helpers"
 
 # =============================================================================
 # Remove aws-controltower-VPC and all associated resources
-# Deletion order: NAT GW → EIPs → IGW → Subnets → Route Tables → CF Stack → VPC
+# NAT GW and EIPs are deleted manually (not in CF stack).
+# Everything else (VPC, IGW, subnets, route tables) is deleted via the
+# CloudFormation stack AWSControlTowerBP-VPC-ACCOUNT-FACTORY-V1.
 # =============================================================================
 
 echo "Checking for aws-controltower-VPC..."
@@ -23,27 +25,24 @@ fi
 echo "Found VPC: $VPC_ID — proceeding with deletion."
 
 # 1. Collect EIP allocation IDs from NAT Gateways before deleting them
-echo "Collecting NAT Gateway EIP allocations..."
 EIP_ALLOC_IDS=$(aws ec2 describe-nat-gateways \
   --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
   --query 'NatGateways[].NatGatewayAddresses[].AllocationId' \
   --output text)
 
-# 2. Delete NAT Gateways
-echo "Deleting NAT Gateways..."
+# 2. Delete NAT Gateways and wait
 NAT_IDS=$(aws ec2 describe-nat-gateways \
   --filter "Name=vpc-id,Values=$VPC_ID" "Name=state,Values=available,pending" \
   --query 'NatGateways[].NatGatewayId' \
   --output text)
 
-for NAT_ID in $NAT_IDS; do
-  echo "  Deleting NAT Gateway: $NAT_ID"
-  aws ec2 delete-nat-gateway --nat-gateway-id "$NAT_ID"
-done
-
-# Wait for all NAT Gateways to finish deleting before releasing EIPs
 if [ -n "$NAT_IDS" ]; then
-  echo "  Waiting for NAT Gateways to be deleted (this may take a few minutes)..."
+  echo "Deleting NAT Gateways..."
+  for NAT_ID in $NAT_IDS; do
+    echo "  Deleting: $NAT_ID"
+    aws ec2 delete-nat-gateway --nat-gateway-id "$NAT_ID"
+  done
+  echo "  Waiting for NAT Gateways to be deleted..."
   for NAT_ID in $NAT_IDS; do
     aws ec2 wait nat-gateway-deleted --nat-gateway-ids "$NAT_ID"
     echo "  $NAT_ID deleted."
@@ -54,66 +53,24 @@ fi
 if [ -n "$EIP_ALLOC_IDS" ]; then
   echo "Releasing Elastic IPs..."
   for ALLOC_ID in $EIP_ALLOC_IDS; do
-    echo "  Releasing EIP: $ALLOC_ID"
+    echo "  Releasing: $ALLOC_ID"
     aws ec2 release-address --allocation-id "$ALLOC_ID" || echo "  Could not release $ALLOC_ID — skipping."
   done
 fi
 
-# 4. Detach and delete Internet Gateways
-echo "Deleting Internet Gateways..."
-IGW_IDS=$(aws ec2 describe-internet-gateways \
-  --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
-  --query 'InternetGateways[].InternetGatewayId' \
-  --output text)
-
-for IGW_ID in $IGW_IDS; do
-  echo "  Detaching IGW: $IGW_ID"
-  aws ec2 detach-internet-gateway --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID"
-  echo "  Deleting IGW: $IGW_ID"
-  aws ec2 delete-internet-gateway --internet-gateway-id "$IGW_ID"
-done
-
-# 5. Delete Subnets
-echo "Deleting Subnets..."
-SUBNET_IDS=$(aws ec2 describe-subnets \
-  --filters "Name=vpc-id,Values=$VPC_ID" \
-  --query 'Subnets[].SubnetId' \
-  --output text)
-
-for SUBNET_ID in $SUBNET_IDS; do
-  echo "  Deleting Subnet: $SUBNET_ID"
-  aws ec2 delete-subnet --subnet-id "$SUBNET_ID"
-done
-
-# 6. Delete non-main Route Tables (main RT is automatically deleted with the VPC)
-echo "Deleting Route Tables..."
-RT_IDS=$(aws ec2 describe-route-tables \
-  --filters "Name=vpc-id,Values=$VPC_ID" \
-  --query 'RouteTables[?!Associations[?Main==`true`]].RouteTableId' \
-  --output text)
-
-for RT_ID in $RT_IDS; do
-  echo "  Deleting Route Table: $RT_ID"
-  aws ec2 delete-route-table --route-table-id "$RT_ID" || echo "  Could not delete $RT_ID — skipping."
-done
-
-# 7. Delete Control Tower VPC CloudFormation stack (owns the VPC resource)
-echo "Checking for Control Tower VPC CloudFormation stack..."
+# 4. Delete CloudFormation stack (cascades to VPC, IGW, subnets, route tables)
 CF_STACK=$(aws cloudformation list-stacks \
   --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE \
   --query 'StackSummaries[?contains(StackName,`AWSControlTowerBP-VPC-ACCOUNT-FACTORY`)].StackName' \
   --output text)
 
 if [ -n "$CF_STACK" ]; then
-  echo "  Deleting CloudFormation stack: $CF_STACK"
+  echo "Deleting CloudFormation stack: $CF_STACK"
   aws cloudformation delete-stack --stack-name "$CF_STACK"
-  echo "  Waiting for stack deletion..."
   aws cloudformation wait stack-delete-complete --stack-name "$CF_STACK"
-  echo "  CloudFormation stack deleted."
+  echo "Stack deleted — VPC and all resources removed."
 else
-  echo "  No Control Tower VPC CloudFormation stack found."
-  # 8. Delete the VPC directly if no CF stack
-  echo "Deleting VPC: $VPC_ID"
+  echo "No CF stack found — deleting VPC directly."
   aws ec2 delete-vpc --vpc-id "$VPC_ID"
 fi
 
